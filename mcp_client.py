@@ -31,7 +31,7 @@ AVIATION_STACK_API_KEY = (
 OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
-WEATHER_SERVER_PATH = BASE_DIR / "custom_weather_mcp_server.py"
+WEATHER_SERVER_PATH = BASE_DIR / "custom_weather_mcp.py"
 UVX_COMMAND = shutil.which("uvx") or "uvx"
 
 
