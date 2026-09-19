@@ -1,39 +1,41 @@
 from pathlib import Path
 import traceback
-
 import uvicorn
+
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 from backend import run_travel_agent, resume_travel_agent
 
-# This is kept from the original project to allow the existing synchronous
-# agent functions to call async MCP helpers inside FastAPI.
+# Allows the sync agent functions in backend.py (flight_agent, hotel_agent,
+# weather_agent) to call asyncio.run(...) on the async MCP helpers even
+# though they run inside FastAPI's already-running event loop. Without
+# this, asyncio.run() raises "cannot be called from a running event loop".
 import nest_asyncio
-
 nest_asyncio.apply()
 
 BASE_DIR = Path(__file__).resolve().parent
 
 app = FastAPI(
     title="TripMate AI",
-    description=(
-        "LangGraph Multi-Agent Travel Planner with Supervisor, Guardrails, "
-        "Human-in-the-Loop, and FastAPI Frontend"
-    ),
-    version="2.0.0",
+    description="LangGraph Multi-Agent Travel Planner with FastAPI Frontend",
+    version="1.0.0"
 )
+
 
 app.mount(
     "/static",
     StaticFiles(directory=str(BASE_DIR / "static")),
-    name="static",
+    name="static"
 )
 
-templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
+
+templates = Jinja2Templates(
+    directory=str(BASE_DIR / "templates")
+)
 
 
 class TravelRequest(BaseModel):
@@ -41,8 +43,8 @@ class TravelRequest(BaseModel):
     thread_id: str | None = None
 
 
-class ApprovalRequest(BaseModel):
-    thread_id: str = Field(min_length=1)
+class ResumeRequest(BaseModel):
+    thread_id: str
     approved: bool
     feedback: str = ""
 
@@ -52,7 +54,7 @@ async def home(request: Request):
     return templates.TemplateResponse(
         request=request,
         name="index.html",
-        context={},
+        context={}
     )
 
 
@@ -66,70 +68,114 @@ async def travel_planner(request_data: TravelRequest):
                 status_code=400,
                 content={
                     "success": False,
-                    "error": "Message cannot be empty.",
-                },
+                    "error": "Message cannot be empty."
+                }
             )
 
+        # run_travel_agent is a plain sync function - called directly,
+        # no await. nest_asyncio (applied above) is what makes the
+        # asyncio.run() calls inside it safe from here.
         result = run_travel_agent(
             user_input=user_message,
-            thread_id=request_data.thread_id,
+            thread_id=request_data.thread_id
         )
 
         return JSONResponse(
             content={
                 "success": True,
-                **result,
+                "thread_id": result["thread_id"],
+                "answer": result["answer"],
+                "requires_approval": result["requires_approval"],
+                "approval_request": result["approval_request"],
+                "guardrail_allowed": result["guardrail_allowed"],
+                "guardrail_reason": result["guardrail_reason"],
+                "flight_results": result["flight_results"],
+                "hotel_results": result["hotel_results"],
+                "weather_results": result["weather_results"],
+                "budget_results": result["budget_results"],
+                "itinerary": result["itinerary"],
+                "selected_agents": result["selected_agents"],
+                "trip_constraints": result["trip_constraints"],
+                "supervisor_reasoning": result["supervisor_reasoning"],
+                "llm_calls": result["llm_calls"],
             }
         )
 
-    except Exception as exc:
-        print("ERROR:", exc)
+    except Exception as e:
+        print("ERROR:", e)
         traceback.print_exc()
 
         return JSONResponse(
             status_code=500,
             content={
                 "success": False,
-                "error": str(exc),
-            },
+                "error": str(e)
+            }
         )
 
 
-@app.post("/api/travel/approve")
-async def approve_travel_plan(request_data: ApprovalRequest):
+@app.post("/api/resume")
+async def resume_travel(request_data: ResumeRequest):
+    """
+    Resumes a LangGraph thread that is paused at the human-in-the-loop
+    approval step (human_approval_agent's interrupt() call in backend.py).
+
+    Called after the user approves the draft itinerary, or submits
+    revision feedback, in response to a /api/travel response where
+    requires_approval was true.
+    """
     try:
-        if not request_data.approved and not request_data.feedback.strip():
+        thread_id = request_data.thread_id.strip()
+
+        if not thread_id:
             return JSONResponse(
                 status_code=400,
                 content={
                     "success": False,
-                    "error": "Please provide revision feedback when rejecting the draft.",
-                },
+                    "error": "thread_id is required to resume a travel plan."
+                }
             )
 
+        # resume_travel_agent is also a plain sync function.
         result = resume_travel_agent(
-            thread_id=request_data.thread_id,
+            thread_id=thread_id,
             approved=request_data.approved,
-            feedback=request_data.feedback,
+            feedback=request_data.feedback
         )
 
         return JSONResponse(
             content={
                 "success": True,
-                **result,
+                "thread_id": result["thread_id"],
+                "answer": result["answer"],
+                "requires_approval": result["requires_approval"],
+                "approval_request": result["approval_request"],
+                "guardrail_allowed": result["guardrail_allowed"],
+                "guardrail_reason": result["guardrail_reason"],
+                "flight_results": result["flight_results"],
+                "hotel_results": result["hotel_results"],
+                "weather_results": result["weather_results"],
+                "budget_results": result["budget_results"],
+                "itinerary": result["itinerary"],
+                "selected_agents": result["selected_agents"],
+                "trip_constraints": result["trip_constraints"],
+                "supervisor_reasoning": result["supervisor_reasoning"],
+                "approved": result["approved"],
+                "human_feedback": result["human_feedback"],
+                "llm_calls": result["llm_calls"],
             }
         )
 
-    except Exception as exc:
-        print("APPROVAL ERROR:", exc)
+    except Exception as e:
+        print("ERROR:", e)
         traceback.print_exc()
 
         return JSONResponse(
             status_code=500,
             content={
                 "success": False,
-                "error": str(exc),
-            },
+                "error": str(e)
+            }
         )
 
 
@@ -137,12 +183,7 @@ async def approve_travel_plan(request_data: ApprovalRequest):
 async def health_check():
     return {
         "status": "ok",
-        "message": "TripMate AI API is running",
-        "features": [
-            "supervisor_agent",
-            "input_guardrail",
-            "human_in_the_loop",
-        ],
+        "message": "AI Travel Planner API is running"
     }
 
 
@@ -151,10 +192,11 @@ async def favicon():
     return JSONResponse(content={})
 
 
+
 if __name__ == "__main__":
     uvicorn.run(
         "app:app",
         host="127.0.0.1",
         port=8000,
-        reload=True,
+        reload=True
     )

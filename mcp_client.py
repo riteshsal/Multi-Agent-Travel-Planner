@@ -216,6 +216,9 @@ async def get_all_tools() -> None:
                 )
                 or "no tools"
             )
+            print(
+                f"{server_name}: OK -> {tool_names}"
+            )
 
         except Exception as exc:
             print(

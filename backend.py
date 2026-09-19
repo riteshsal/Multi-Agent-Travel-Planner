@@ -1,8 +1,8 @@
 import os
 import certifi
 from dotenv import load_dotenv
-
 load_dotenv()
+
 os.environ["SSL_CERT_FILE"] = certifi.where()
 os.environ["REQUESTS_CA_BUNDLE"] = certifi.where()
 
@@ -23,7 +23,6 @@ from langchain_core.messages import (
     SystemMessage,
 )
 from langchain_groq import ChatGroq
-
 
 from mcp_client import (
     tavily_mcp_search,
@@ -51,21 +50,24 @@ def get_database_url():
 
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-
 if not GROQ_API_KEY:
     raise ValueError("GROQ_API_KEY is missing. Please add it to your .env file.")
+
 
 # =========================
 # LLM - original model kept
 # =========================
+
 llm = ChatGroq(
     model="openai/gpt-oss-20b",
     api_key=GROQ_API_KEY,
 )
 
+
 # =========================
 # State - original fields kept, new control fields added
 # =========================
+
 class TravelState(TypedDict, total=False):
     messages: Annotated[list[AnyMessage], operator.add]
     user_query: str
@@ -96,6 +98,7 @@ class TravelState(TypedDict, total=False):
 # =========================
 # Shared helpers
 # =========================
+
 KNOWN_AGENTS = {
     "flight_agent",
     "hotel_agent",
@@ -148,6 +151,7 @@ def _empty_constraints() -> dict[str, Any]:
 # =========================
 # Supervisor Agent + Input Guardrail
 # =========================
+
 def supervisor_agent(state: TravelState):
     query = state["user_query"]
     llm_calls = state.get("llm_calls", 0)
@@ -156,7 +160,6 @@ def supervisor_agent(state: TravelState):
 Determine whether the following request belongs to travel planning or travel
 information. Valid requests can include destinations, flights, hotels, weather,
 budgets, visas, transportation, sightseeing, food, packing, or itineraries.
-
 Block clearly unrelated requests and requests asking for harmful or illegal
 instructions. Do not block a valid travel request merely because some details
 are missing.
@@ -241,6 +244,7 @@ User request:
         )
         parsed = _json_from_llm(supervisor_raw)
         requested_agents = parsed.get("selected_agents", [])
+
         selected_agents = [
             name for name in AGENT_ORDER
             if name in requested_agents and name in KNOWN_AGENTS
@@ -281,6 +285,7 @@ User request:
 # =========================
 # Guardrail blocked response
 # =========================
+
 def guardrail_blocked_agent(state: TravelState):
     reason = state.get("final_response") or state.get("guardrail_reason") or (
         "This request was blocked by the travel input guardrail."
@@ -292,8 +297,11 @@ def guardrail_blocked_agent(state: TravelState):
 
 
 # =========================
-# Flight Agent - original behavior kept
+# Flight Agent - sync, uses asyncio.run() to call the async MCP helper
+# (nest_asyncio, applied in app.py, allows this to run safely inside
+# FastAPI's already-running event loop)
 # =========================
+
 FLIGHT_AGENT_PROMPT = """
 You are a travel flight expert.
 
@@ -342,8 +350,11 @@ def flight_agent(state: TravelState):
                 HumanMessage(content=prompt),
             ]
         )
+
         flight_data = response.content
+
     except Exception as exc:
+        print(f"FLIGHT AGENT MCP ERROR: {type(exc).__name__}: {exc}", flush=True)
         flight_data = f"Flight information unavailable: {exc}"
 
     return {
@@ -354,8 +365,9 @@ def flight_agent(state: TravelState):
 
 
 # =========================
-# Hotel Agent - original behavior kept
+# Hotel Agent - sync, uses asyncio.run() to call the async MCP helper
 # =========================
+
 def hotel_agent(state: TravelState):
     query = (
         f"Best hotels for "
@@ -363,17 +375,13 @@ def hotel_agent(state: TravelState):
     )
 
     try:
-        hotel_results = asyncio.run(
-            tavily_mcp_search(query)
-        )
-
+        hotel_results = asyncio.run(tavily_mcp_search(query))
     except Exception as exc:
         print(
             f"HOTEL AGENT MCP ERROR: "
             f"{type(exc).__name__}: {exc}",
             flush=True,
         )
-
         hotel_results = (
             "Live hotel search is temporarily unavailable. "
             "Provide general accommodation and neighborhood "
@@ -395,21 +403,17 @@ def hotel_agent(state: TravelState):
 
 
 # =========================
-# Weather Agent - original behavior kept
+# Weather Agent - sync, uses asyncio.run() to call the async MCP helpers
 # =========================
+
 def weather_agent(state: TravelState):
     city = extract_destination(
         state["user_query"]
     )
 
     try:
-        weather_data = asyncio.run(
-            weather_mcp_search(city)
-        )
-
-        forecast_data = asyncio.run(
-            forecast_mcp_search(city)
-        )
+        weather_data = asyncio.run(weather_mcp_search(city))
+        forecast_data = asyncio.run(forecast_mcp_search(city))
 
         weather_results = f"""
 Current Weather:
@@ -418,14 +422,12 @@ Current Weather:
 Forecast:
 {forecast_data}
 """
-
     except Exception as exc:
         print(
             f"WEATHER AGENT MCP ERROR: "
             f"{type(exc).__name__}: {exc}",
             flush=True,
         )
-
         weather_results = (
             f"Live weather information for {city} "
             "is temporarily unavailable. Give general "
@@ -444,8 +446,9 @@ Forecast:
 
 
 # =========================
-# Budget Agent - new specialist
+# Budget Agent - new specialist (sync, no MCP calls)
 # =========================
+
 def budget_agent(state: TravelState):
     prompt = f"""
 Analyze whether this trip is realistic for the user's budget.
@@ -489,8 +492,9 @@ If exact live prices are unavailable, clearly label estimates as approximate.
 
 
 # =========================
-# Itinerary Agent - original behavior extended with selected results
+# Itinerary Agent - original behavior extended with selected results (sync)
 # =========================
+
 def itinerary_agent(state: TravelState):
     prompt = f"""
 Create a complete travel itinerary.
@@ -540,6 +544,7 @@ Create a clear draft that is ready for human review.
 # =========================
 # Human-in-the-Loop approval
 # =========================
+
 def human_approval_agent(state: TravelState):
     # Do not wrap interrupt() in try/except. LangGraph uses it to pause execution.
     review = interrupt(
@@ -567,8 +572,9 @@ def human_approval_agent(state: TravelState):
 
 
 # =========================
-# Final Response Agent - original format kept, HITL feedback added
+# Final Response Agent - original format kept, HITL feedback added (sync)
 # =========================
+
 def final_agent(state: TravelState):
     if state.get("approved", False):
         review_instruction = (
@@ -643,6 +649,7 @@ Important:
 # =========================
 # Dynamic Supervisor Routing
 # =========================
+
 ROUTE_MAP = {
     "guardrail_blocked": "guardrail_blocked",
     "flight_agent": "flight_agent",
@@ -683,6 +690,7 @@ def route_after_agent(current_agent: str):
 # =========================
 # Build Graph
 # =========================
+
 graph = StateGraph(TravelState)
 
 graph.add_node("supervisor", supervisor_agent)
@@ -716,15 +724,19 @@ graph.add_edge("human_approval", "final_agent")
 graph.add_edge("final_agent", END)
 graph.add_edge("guardrail_blocked", END)
 
+
 # =========================
-# PostgreSQL Checkpointer - original persistence kept
+# PostgreSQL Checkpointer - original sync persistence kept
 # =========================
+
 DATABASE_URL = get_database_url()
+
 _conn = psycopg.connect(
     DATABASE_URL,
     autocommit=True,
     row_factory=dict_row,
 )
+
 checkpointer = PostgresSaver(_conn)
 checkpointer.setup()
 
@@ -734,8 +746,10 @@ travel_graph = graph.compile(checkpointer=checkpointer)
 # =========================
 # FastAPI-facing helpers
 # =========================
+
 def _interrupt_payload(result: dict[str, Any]) -> dict[str, Any] | None:
     interrupts = result.get("__interrupt__", [])
+
     if not interrupts:
         return None
 
@@ -750,6 +764,7 @@ def _serialize_result(
 ) -> dict[str, Any]:
     messages = result.get("messages", [])
     last_message = messages[-1].content if messages else ""
+
     answer = result.get("final_response") or last_message
     interrupt_payload = _interrupt_payload(result)
 
@@ -789,6 +804,7 @@ def _serialize_result(
 
 def run_travel_agent(user_input: str, thread_id: str | None = None):
     """Start a new travel-planning run and pause at human approval."""
+
     if not thread_id:
         thread_id = f"user_{uuid.uuid4().hex}"
 
@@ -826,10 +842,12 @@ def resume_travel_agent(
     feedback: str = "",
 ):
     """Resume the paused LangGraph thread after human review."""
+
     if not thread_id:
         raise ValueError("thread_id is required to resume a travel plan.")
 
     config = {"configurable": {"thread_id": thread_id}}
+
     result = travel_graph.invoke(
         Command(
             resume={
