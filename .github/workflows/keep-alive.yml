@@ -15,6 +15,6 @@ jobs:
       - name: Ping the app
         run: |
           echo "Pinging app to keep it awake..."
-          curl -sS -o /dev/null -w "HTTP status: %{http_code}\n" "$APP_URL" --max-time 30
+          curl -sS -o /dev/null -w "HTTP status: %{http_code}\n" "$APP_URL" --max-time 90
         env:
           APP_URL: ${{ secrets.RENDER_APP_URL }}
