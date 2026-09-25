@@ -65,7 +65,9 @@ llm = ChatGroq(
 
 
 # =========================
-# State - original fields kept, new control fields added
+# State - original fields kept.
+# llm_calls now uses an additive reducer so multiple agents can write
+# to it in the SAME step (parallel execution) without conflicting.
 # =========================
 
 class TravelState(TypedDict, total=False):
@@ -92,7 +94,7 @@ class TravelState(TypedDict, total=False):
     human_feedback: str
     final_response: str
 
-    llm_calls: int
+    llm_calls: Annotated[int, operator.add]
 
 
 # =========================
@@ -114,6 +116,10 @@ AGENT_ORDER = [
     "budget_agent",
     "itinerary_agent",
 ]
+
+# The three specialist agents that don't depend on each other's output.
+# They run in parallel (fan-out) instead of one after another.
+PARALLEL_AGENTS = ["flight_agent", "hotel_agent", "weather_agent"]
 
 
 def _llm_text(system_prompt: str, user_prompt: str) -> str:
@@ -173,7 +179,7 @@ def _truncate(text, max_chars: int = 1200) -> str:
 
 def supervisor_agent(state: TravelState):
     query = state["user_query"]
-    llm_calls = state.get("llm_calls", 0)
+    llm_calls_delta = 0
 
     guardrail_prompt = f"""
 Determine whether the following request belongs to travel planning or travel
@@ -204,7 +210,7 @@ User request:
         guardrail_result = _json_from_llm(guardrail_raw)
         allowed = bool(guardrail_result.get("allowed", True))
         guardrail_reason = str(guardrail_result.get("reason", "")).strip()
-        llm_calls += 1
+        llm_calls_delta += 1
     except Exception as exc:
         print(f"Guardrail fallback used: {exc}")
         allowed = True
@@ -224,7 +230,7 @@ User request:
             "supervisor_reasoning": reason,
             "final_response": reason,
             "messages": [AIMessage(content=f"Guardrail blocked request: {reason}")],
-            "llm_calls": llm_calls,
+            "llm_calls": llm_calls_delta,
         }
 
     supervisor_prompt = f"""
@@ -279,7 +285,7 @@ User request:
             constraints.update(parsed_constraints)
 
         reasoning = str(parsed.get("reasoning", "")).strip()
-        llm_calls += 1
+        llm_calls_delta += 1
     except Exception as exc:
         print(f"Supervisor fallback used: {exc}")
         # Original workflow behavior is preserved as the fallback.
@@ -297,7 +303,7 @@ User request:
         "trip_constraints": constraints,
         "supervisor_reasoning": reasoning,
         "messages": [AIMessage(content="Supervisor created the agent plan.")],
-        "llm_calls": llm_calls,
+        "llm_calls": llm_calls_delta,
     }
 
 
@@ -316,7 +322,7 @@ def guardrail_blocked_agent(state: TravelState):
 
 
 # =========================
-# Flight Agent - original behavior kept
+# Flight Agent - original behavior kept, only llm_calls delta changed
 # =========================
 
 FLIGHT_AGENT_PROMPT = """
@@ -376,12 +382,12 @@ def flight_agent(state: TravelState):
     return {
         "flight_results": flight_data,
         "messages": [AIMessage(content="Flight recommendations generated")],
-        "llm_calls": state.get("llm_calls", 0) + 1,
+        "llm_calls": 1,
     }
 
 
 # =========================
-# Hotel Agent - original behavior kept
+# Hotel Agent - original behavior kept, only llm_calls delta changed
 # =========================
 
 def hotel_agent(state: TravelState):
@@ -414,14 +420,12 @@ def hotel_agent(state: TravelState):
                 content="Hotel information processed."
             )
         ],
-        "llm_calls": (
-            state.get("llm_calls", 0) + 1
-        ),
+        "llm_calls": 1,
     }
 
 
 # =========================
-# Weather Agent - original behavior kept
+# Weather Agent - original behavior kept, only llm_calls delta added
 # =========================
 
 def weather_agent(state: TravelState):
@@ -464,7 +468,21 @@ Forecast:
                 content="Weather information processed."
             )
         ],
+        # extract_destination() also calls the LLM, so this node makes
+        # one LLM call even though the original code never counted it.
+        "llm_calls": 1,
     }
+
+
+# =========================
+# Join point for the three parallel agents.
+# LangGraph automatically waits here for every agent that was actually
+# scheduled (flight/hotel/weather) to finish before this node runs -
+# no manual "wait" logic is needed. This node itself does no work.
+# =========================
+
+def post_data_gather(state: TravelState):
+    return {}
 
 
 # =========================
@@ -509,7 +527,7 @@ If exact live prices are unavailable, clearly label estimates as approximate.
     return {
         "budget_results": response.content,
         "messages": [AIMessage(content="Budget assessment generated.")],
-        "llm_calls": state.get("llm_calls", 0) + 1,
+        "llm_calls": 1,
     }
 
 
@@ -559,7 +577,7 @@ Create a clear draft that is ready for human review.
         "itinerary": response.content,
         "approval_request": approval_request,
         "messages": [AIMessage(content="Draft itinerary created for human review.")],
-        "llm_calls": state.get("llm_calls", 0) + 1,
+        "llm_calls": 1,
     }
 
 
@@ -664,49 +682,41 @@ Important:
     return {
         "final_response": response.content,
         "messages": [response],
-        "llm_calls": state.get("llm_calls", 0) + 1,
+        "llm_calls": 1,
     }
 
 
 # =========================
-# Dynamic Supervisor Routing
+# Routing
+#
+# flight_agent, hotel_agent and weather_agent no longer chain into each
+# other. The supervisor fans out to all of them at once (whichever were
+# selected), and post_data_gather is the single point they all rejoin at
+# before deciding whether to run budget_agent next.
 # =========================
 
-ROUTE_MAP = {
-    "guardrail_blocked": "guardrail_blocked",
-    "flight_agent": "flight_agent",
-    "hotel_agent": "hotel_agent",
-    "weather_agent": "weather_agent",
-    "budget_agent": "budget_agent",
-    "itinerary_agent": "itinerary_agent",
-}
-
-
-def _selected_agents(state: TravelState) -> list[str]:
-    selected = state.get("selected_agents", [])
-    return [agent for agent in AGENT_ORDER if agent in selected]
-
-
-def route_from_supervisor(state: TravelState) -> str:
+def route_from_supervisor(state: TravelState):
     if not state.get("guardrail_allowed", True):
         return "guardrail_blocked"
 
-    selected = _selected_agents(state)
-    return selected[0] if selected else "itinerary_agent"
+    selected = state.get("selected_agents", [])
+    parallel_targets = [name for name in PARALLEL_AGENTS if name in selected]
+
+    if parallel_targets:
+        # Returning a list fans out to every node in it - they run
+        # concurrently in the same step instead of one after another.
+        return parallel_targets
+
+    # None of flight/hotel/weather were selected - skip straight to the
+    # join node, which will immediately pass through to budget/itinerary.
+    return "post_data_gather"
 
 
-def route_after_agent(current_agent: str):
-    def route(state: TravelState) -> str:
-        selected = _selected_agents(state)
-        current_index = AGENT_ORDER.index(current_agent)
-
-        for next_agent in AGENT_ORDER[current_index + 1 :]:
-            if next_agent in selected:
-                return next_agent
-
-        return "itinerary_agent"
-
-    return route
+def route_after_gather(state: TravelState) -> str:
+    selected = state.get("selected_agents", [])
+    if "budget_agent" in selected:
+        return "budget_agent"
+    return "itinerary_agent"
 
 
 # =========================
@@ -720,27 +730,33 @@ graph.add_node("guardrail_blocked", guardrail_blocked_agent)
 graph.add_node("flight_agent", flight_agent)
 graph.add_node("hotel_agent", hotel_agent)
 graph.add_node("weather_agent", weather_agent)
+graph.add_node("post_data_gather", post_data_gather)
 graph.add_node("budget_agent", budget_agent)
 graph.add_node("itinerary_agent", itinerary_agent)
 graph.add_node("human_approval", human_approval_agent)
 graph.add_node("final_agent", final_agent)
 
 graph.add_edge(START, "supervisor")
-graph.add_conditional_edges("supervisor", route_from_supervisor, ROUTE_MAP)
 
 graph.add_conditional_edges(
-    "flight_agent", route_after_agent("flight_agent"), ROUTE_MAP
-)
-graph.add_conditional_edges(
-    "hotel_agent", route_after_agent("hotel_agent"), ROUTE_MAP
-)
-graph.add_conditional_edges(
-    "weather_agent", route_after_agent("weather_agent"), ROUTE_MAP
-)
-graph.add_conditional_edges(
-    "budget_agent", route_after_agent("budget_agent"), ROUTE_MAP
+    "supervisor",
+    route_from_supervisor,
+    ["flight_agent", "hotel_agent", "weather_agent", "post_data_gather", "guardrail_blocked"],
 )
 
+# Whichever of these three actually ran, they all converge here.
+# LangGraph waits for all scheduled branches before running post_data_gather.
+graph.add_edge("flight_agent", "post_data_gather")
+graph.add_edge("hotel_agent", "post_data_gather")
+graph.add_edge("weather_agent", "post_data_gather")
+
+graph.add_conditional_edges(
+    "post_data_gather",
+    route_after_gather,
+    ["budget_agent", "itinerary_agent"],
+)
+
+graph.add_edge("budget_agent", "itinerary_agent")
 graph.add_edge("itinerary_agent", "human_approval")
 graph.add_edge("human_approval", "final_agent")
 graph.add_edge("final_agent", END)
